@@ -1,0 +1,6 @@
+{
+  "name": "Waktu Order Lokasi",
+  "description": "Aplikasi pelacak riwayat jam order dan pengingat lokasi pengiriman.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
