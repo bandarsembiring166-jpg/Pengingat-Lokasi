@@ -4,6 +4,7 @@ import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import com.example.security.CryptoManager
 import java.io.Serializable
 
 @Entity(tableName = "saved_locations")
@@ -58,3 +59,36 @@ data class OrderWithLocation(
     val locationNotes: String,
     val syncStatus: Int
 ) : Serializable
+
+fun SavedLocation.encrypt(): SavedLocation = copy(
+    name = CryptoManager.encrypt(name),
+    address = CryptoManager.encrypt(address),
+    notes = CryptoManager.encrypt(notes)
+)
+
+fun SavedLocation.decrypt(): SavedLocation = copy(
+    name = CryptoManager.decrypt(name),
+    address = CryptoManager.decrypt(address),
+    notes = CryptoManager.decrypt(notes)
+)
+
+fun OrderLog.encrypt(): OrderLog = copy(
+    itemsDescription = CryptoManager.encrypt(itemsDescription),
+    customerName = CryptoManager.encrypt(customerName),
+    notes = CryptoManager.encrypt(notes)
+)
+
+fun OrderLog.decrypt(): OrderLog = copy(
+    itemsDescription = CryptoManager.decrypt(itemsDescription),
+    customerName = CryptoManager.decrypt(customerName),
+    notes = CryptoManager.decrypt(notes)
+)
+
+fun OrderWithLocation.decrypt(): OrderWithLocation = copy(
+    locationName = CryptoManager.decrypt(locationName),
+    locationAddress = CryptoManager.decrypt(locationAddress),
+    itemsDescription = CryptoManager.decrypt(itemsDescription),
+    customerName = CryptoManager.decrypt(customerName),
+    orderNotes = CryptoManager.decrypt(orderNotes),
+    locationNotes = CryptoManager.decrypt(locationNotes)
+)

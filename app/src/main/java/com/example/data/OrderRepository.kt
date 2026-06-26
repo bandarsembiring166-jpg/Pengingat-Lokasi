@@ -4,24 +4,32 @@ import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import com.example.security.CryptoManager
 
 class OrderRepository(
     private val locationDao: SavedLocationDao,
     private val orderDao: OrderLogDao
 ) {
-    val allLocations: Flow<List<SavedLocation>> = locationDao.getAllLocations()
-    val allOrdersWithLocation: Flow<List<OrderWithLocation>> = orderDao.getAllOrdersWithLocation()
+    val allLocations: Flow<List<SavedLocation>> = locationDao.getAllLocations().map { list ->
+        list.map { it.decrypt() }
+    }
+    val allOrdersWithLocation: Flow<List<OrderWithLocation>> = orderDao.getAllOrdersWithLocation().map { list ->
+        list.map { it.decrypt() }
+    }
 
     fun getOrdersByLocation(locationId: Int): Flow<List<OrderWithLocation>> {
-        return orderDao.getOrdersByLocationId(locationId)
+        return orderDao.getOrdersByLocationId(locationId).map { list ->
+            list.map { it.decrypt() }
+        }
     }
 
     suspend fun insertLocation(location: SavedLocation): Long {
-        return locationDao.insertLocation(location)
+        return locationDao.insertLocation(location.encrypt())
     }
 
     suspend fun updateLocation(location: SavedLocation) {
-        locationDao.updateLocation(location)
+        locationDao.updateLocation(location.encrypt())
     }
 
     suspend fun deleteLocation(location: SavedLocation) {
@@ -29,11 +37,11 @@ class OrderRepository(
     }
 
     suspend fun insertOrder(order: OrderLog): Long {
-        return orderDao.insertOrder(order)
+        return orderDao.insertOrder(order.encrypt())
     }
 
     suspend fun updateOrder(order: OrderLog) {
-        orderDao.updateOrder(order)
+        orderDao.updateOrder(order.encrypt())
     }
 
     suspend fun deleteOrder(order: OrderLog) {
@@ -101,13 +109,15 @@ class OrderRepository(
 
         val payload = BackupPayload(backupLocations, backupOrders)
         val adapter = moshi.adapter(BackupPayload::class.java)
-        return adapter.toJson(payload)
+        val jsonString = adapter.toJson(payload)
+        return CryptoManager.encrypt(jsonString)
     }
 
     suspend fun importDataFromJson(jsonString: String): Result<Pair<Int, Int>> {
         return try {
+            val decryptedJson = CryptoManager.decrypt(jsonString.trim())
             val adapter = moshi.adapter(BackupPayload::class.java)
-            val payload = adapter.fromJson(jsonString) ?: return Result.failure(Exception("Format data JSON tidak valid"))
+            val payload = adapter.fromJson(decryptedJson) ?: return Result.failure(Exception("Format data JSON tidak valid"))
 
             var importedLocationsCount = 0
             var importedOrdersCount = 0
@@ -133,7 +143,7 @@ class OrderRepository(
                             notes = backupLoc.notes,
                             isFavorite = backupLoc.isFavorite,
                             createdAt = backupLoc.createdAt
-                        )
+                        ).encrypt()
                     )
                     locationMap[key] = newId.toInt()
                     importedLocationsCount++
@@ -165,7 +175,7 @@ class OrderRepository(
                             customerName = backupOrder.customerName,
                             notes = backupOrder.notes,
                             syncStatus = 1 // Mark as synchronized
-                        )
+                        ).encrypt()
                     )
                     importedOrdersCount++
                 }

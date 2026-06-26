@@ -7,6 +7,8 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.*
 import com.example.location.LocationTracker
 import com.example.notification.NotificationHelper
+import com.example.security.SecurePreferenceManager
+import com.google.android.gms.auth.api.signin.GoogleSignInAccount
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -16,6 +18,20 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = OrderRepository(database.savedLocationDao(), database.orderLogDao())
     private val locationTracker = LocationTracker(application)
     private val notificationHelper = NotificationHelper(application)
+    private val securePrefs = SecurePreferenceManager(application)
+
+    // User profile state flows (securely stored & encrypted)
+    private val _isLoggedIn = MutableStateFlow(securePrefs.isLoggedIn)
+    val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
+
+    private val _userDisplayName = MutableStateFlow(securePrefs.displayName)
+    val userDisplayName: StateFlow<String?> = _userDisplayName.asStateFlow()
+
+    private val _userEmail = MutableStateFlow(securePrefs.email)
+    val userEmail: StateFlow<String?> = _userEmail.asStateFlow()
+
+    private val _userPhotoUrl = MutableStateFlow(securePrefs.photoUrl)
+    val userPhotoUrl: StateFlow<String?> = _userPhotoUrl.asStateFlow()
 
     // UI state flows
     val locations: StateFlow<List<SavedLocation>> = repository.allLocations
@@ -244,6 +260,10 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // --- Simulation Controls ---
+    fun hasLocationPermission(): Boolean {
+        return locationTracker.hasLocationPermission()
+    }
+
     fun toggleSimulation(enabled: Boolean) {
         _isSimulationEnabled.value = enabled
     }
@@ -282,6 +302,64 @@ class OrderViewModel(application: Application) : AndroidViewModel(application) {
             result.onFailure { error ->
                 _uiEvent.emit(UiEvent.ShowError("Format Kode Sync salah atau korup: ${error.message}"))
             }
+        }
+    }
+
+    // --- Google Authentication and Secure Profile ---
+    fun handleGoogleSignInResult(account: GoogleSignInAccount) {
+        securePrefs.isLoggedIn = true
+        securePrefs.displayName = account.displayName
+        securePrefs.email = account.email
+        securePrefs.photoUrl = account.photoUrl?.toString()
+        securePrefs.idToken = account.idToken
+
+        _isLoggedIn.value = true
+        _userDisplayName.value = account.displayName
+        _userEmail.value = account.email
+        _userPhotoUrl.value = account.photoUrl?.toString()
+
+        viewModelScope.launch {
+            _uiEvent.emit(UiEvent.ShowSuccess("Berhasil masuk menggunakan Google: ${account.displayName}"))
+        }
+    }
+
+    fun simulateGoogleSignIn(name: String, email: String, photoUrl: String?) {
+        securePrefs.isLoggedIn = true
+        securePrefs.displayName = name
+        securePrefs.email = email
+        securePrefs.photoUrl = photoUrl
+        securePrefs.idToken = "simulated_google_token_123"
+
+        _isLoggedIn.value = true
+        _userDisplayName.value = name
+        _userEmail.value = email
+        _userPhotoUrl.value = photoUrl
+
+        viewModelScope.launch {
+            _uiEvent.emit(UiEvent.ShowSuccess("Simulasi Google Sign-In berhasil untuk: $name"))
+        }
+    }
+
+    fun signOut() {
+        securePrefs.clearProfile()
+        _isLoggedIn.value = false
+        _userDisplayName.value = null
+        _userEmail.value = null
+        _userPhotoUrl.value = null
+
+        viewModelScope.launch {
+            _uiEvent.emit(UiEvent.ShowSuccess("Berhasil keluar dari akun"))
+        }
+    }
+
+    fun updateProfile(name: String, email: String) {
+        securePrefs.displayName = name
+        securePrefs.email = email
+        _userDisplayName.value = name
+        _userEmail.value = email
+
+        viewModelScope.launch {
+            _uiEvent.emit(UiEvent.ShowSuccess("Profil terenkripsi berhasil diperbarui"))
         }
     }
 }

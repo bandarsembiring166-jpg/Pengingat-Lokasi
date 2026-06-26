@@ -40,6 +40,18 @@ import com.example.data.OrderLog
 import com.example.data.SavedLocation
 import com.example.data.OrderWithLocation
 import com.example.viewmodel.OrderViewModel
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.ApiException
+import coil.compose.AsyncImage
+import androidx.compose.foundation.Canvas
+import androidx.compose.animation.core.*
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
+import kotlin.math.sqrt
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.text.NumberFormat
@@ -64,6 +76,59 @@ fun MainApp(
     val simulatedLat by viewModel.simulatedLat.collectAsStateWithLifecycle()
     val simulatedLng by viewModel.simulatedLng.collectAsStateWithLifecycle()
     val syncStatus by viewModel.syncStatus.collectAsStateWithLifecycle()
+
+    // Secure user profile states (fully encrypted in SharedPreferences)
+    val isLoggedIn by viewModel.isLoggedIn.collectAsStateWithLifecycle()
+    val userDisplayName by viewModel.userDisplayName.collectAsStateWithLifecycle()
+    val userEmail by viewModel.userEmail.collectAsStateWithLifecycle()
+    val userPhotoUrl by viewModel.userPhotoUrl.collectAsStateWithLifecycle()
+
+    // Google Sign-In Configuration
+    val gso = remember {
+        GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestEmail()
+            .requestProfile()
+            .build()
+    }
+    val googleSignInClient = remember { GoogleSignIn.getClient(context, gso) }
+
+    val googleSignInLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+        try {
+            val account = task.getResult(ApiException::class.java)
+            if (account != null) {
+                viewModel.handleGoogleSignInResult(account)
+            } else {
+                scope.launch {
+                    snackbarHostState.showSnackbar("Gagal mendapatkan akun Google")
+                }
+            }
+        } catch (e: ApiException) {
+            e.printStackTrace()
+            scope.launch {
+                val errorCode = e.statusCode
+                snackbarHostState.showSnackbar("Gagal login Google (Error $errorCode). Silakan gunakan simulasi login aman.")
+            }
+        }
+    }
+
+    var locationPermissionGranted by remember { mutableStateOf(viewModel.hasLocationPermission()) }
+
+    // Foreground Permission Launcher (Strictly enforces while-in-use ACCESS_FINE_LOCATION and ACCESS_COARSE_LOCATION)
+    val permissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val fineGranted = permissions[android.Manifest.permission.ACCESS_FINE_LOCATION] == true
+        val coarseGranted = permissions[android.Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        locationPermissionGranted = fineGranted || coarseGranted
+    }
+
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner) {
+        locationPermissionGranted = viewModel.hasLocationPermission()
+    }
 
     // Navigation and tab states
     var currentTab by remember { mutableStateOf(0) } // 0 = Beranda, 1 = Lokasi, 2 = Sync
@@ -167,6 +232,13 @@ fun MainApp(
                     label = { Text("Sinkronisasi") },
                     modifier = Modifier.testTag("nav_sync")
                 )
+                NavigationBarItem(
+                    selected = currentTab == 3,
+                    onClick = { currentTab = 3 },
+                    icon = { Icon(Icons.Default.Person, contentDescription = "Profil") },
+                    label = { Text("Profil") },
+                    modifier = Modifier.testTag("nav_profile")
+                )
             }
         },
         containerColor = MaterialTheme.colorScheme.background,
@@ -186,7 +258,22 @@ fun MainApp(
                     isSimulationEnabled = isSimulationEnabled,
                     simulatedLat = simulatedLat,
                     simulatedLng = simulatedLng,
-                    onNavigateToLocations = { currentTab = 1 }
+                    locationPermissionGranted = locationPermissionGranted,
+                    onRequestPermission = {
+                        permissionLauncher.launch(
+                            arrayOf(
+                                android.Manifest.permission.ACCESS_FINE_LOCATION,
+                                android.Manifest.permission.ACCESS_COARSE_LOCATION
+                            )
+                        )
+                    },
+                    onNavigateToLocations = { currentTab = 1 },
+                    onAddOrderClick = { locationToAddOrder = it },
+                    onViewHistoryClick = { selectedLocationForHistory = it },
+                    onFlyToLocation = { loc ->
+                        viewModel.toggleSimulation(true)
+                        viewModel.updateSimulatedCoordinates(loc.latitude, loc.longitude)
+                    }
                 )
                 1 -> LocationsScreen(
                     viewModel = viewModel,
@@ -204,6 +291,17 @@ fun MainApp(
                 2 -> SyncScreen(
                     viewModel = viewModel,
                     syncStatus = syncStatus
+                )
+                3 -> ProfileScreen(
+                    viewModel = viewModel,
+                    isLoggedIn = isLoggedIn,
+                    displayName = userDisplayName,
+                    email = userEmail,
+                    photoUrl = userPhotoUrl,
+                    onGoogleSignInClick = {
+                        val signInIntent = googleSignInClient.signInIntent
+                        googleSignInLauncher.launch(signInIntent)
+                    }
                 )
             }
 
@@ -286,7 +384,12 @@ fun DashboardScreen(
     isSimulationEnabled: Boolean,
     simulatedLat: Double,
     simulatedLng: Double,
-    onNavigateToLocations: () -> Unit
+    locationPermissionGranted: Boolean,
+    onRequestPermission: () -> Unit,
+    onNavigateToLocations: () -> Unit,
+    onAddOrderClick: (SavedLocation) -> Unit,
+    onViewHistoryClick: (SavedLocation) -> Unit,
+    onFlyToLocation: (SavedLocation) -> Unit
 ) {
     LazyColumn(
         modifier = Modifier
@@ -430,6 +533,19 @@ fun DashboardScreen(
             }
         }
 
+        // 4. Interactive Live GPS Map
+        item {
+            InteractiveCustomMap(
+                locations = locations,
+                orders = orders,
+                simulatedLat = simulatedLat,
+                simulatedLng = simulatedLng,
+                onAddOrderClick = onAddOrderClick,
+                onViewHistoryClick = onViewHistoryClick,
+                onFlyToLocation = onFlyToLocation
+            )
+        }
+
         // Summary Indicators (Stats grid)
         item {
             Row(
@@ -489,7 +605,7 @@ fun DashboardScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Kurir tidak dapat bergerak fisik di browser. Gunakan kontrol di bawah untuk memindahkan lokasi virtual Anda. Ketika Anda berada kurang dari 300m dari lokasi order, ponsel akan berdering memberi peringatan!",
+                        text = "Kurir tidak dapat bergerak fisik di browser. Gunakan kontrol di bawah untuk memindahkan lokasi virtual Anda atau klik penanda di peta. Ketika berada <300m dari lokasi order, alarm pengingat berdering!",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         lineHeight = 16.sp
@@ -618,6 +734,270 @@ fun DashboardScreen(
                             }
                         }
                     }
+
+                    AnimatedVisibility(
+                        visible = !isSimulationEnabled,
+                        enter = fadeIn(),
+                        exit = fadeOut()
+                    ) {
+                        Column(modifier = Modifier.padding(top = 12.dp)) {
+                            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            if (locationPermissionGranted) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f))
+                                        .padding(12.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CheckCircle,
+                                        contentDescription = "Security verified",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column {
+                                        Text(
+                                            text = "Akses GPS Aktif & Aman",
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 13.sp,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                                        )
+                                        Text(
+                                            text = "Izin lokasi foreground diberikan. Koordinat GPS asli sedang dilacak secara aman hanya saat aplikasi terbuka.",
+                                            fontSize = 11.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            lineHeight = 15.sp
+                                        )
+                                    }
+                                }
+                            } else {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.2f))
+                                        .padding(12.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Security,
+                                            contentDescription = "Strict Location Control",
+                                            tint = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(12.dp))
+                                        Text(
+                                            text = "Izin Lokasi Diperlukan (Aktif Saja)",
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 13.sp,
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        text = "Untuk melacak pengiriman nyata, aplikasi memerlukan izin GPS foreground. Kami menerapkan kontrol ketat: data lokasi HANYA diakses saat aplikasi aktif di layar untuk melindungi privasi Anda sepenuhnya.",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        lineHeight = 15.sp
+                                    )
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Button(
+                                        onClick = onRequestPermission,
+                                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Icon(Icons.Default.MyLocation, null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Aktifkan GPS (Hanya Saat Aktif)", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Riwayat Penanda Order Sebelumnya (History of locations with orders)
+        val locationsWithOrders = locations.filter { loc -> orders.any { it.locationId == loc.id } }
+
+        item {
+            Text(
+                text = "Riwayat Penanda Order Sebelumnya",
+                fontWeight = FontWeight.Bold,
+                fontSize = 16.sp,
+                modifier = Modifier.padding(top = 8.dp)
+            )
+        }
+
+        if (locationsWithOrders.isEmpty()) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Box(modifier = Modifier.padding(20.dp), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                imageVector = Icons.Default.PinDrop,
+                                contentDescription = null,
+                                modifier = Modifier.size(36.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Belum ada penanda order sebelumnya. Tambah order pada suatu lokasi terlebih dahulu.",
+                                fontSize = 12.sp,
+                                textAlign = TextAlign.Center,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            items(locationsWithOrders, key = { "loc_order_${it.id}" }) { loc ->
+                val locOrders = orders.filter { it.locationId == loc.id }.sortedByDescending { it.orderTime }
+                val latestOrder = locOrders.firstOrNull()
+
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onViewHistoryClick(loc) }
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                Icon(
+                                    imageVector = Icons.Default.LocationOn,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = loc.name,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 15.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Badge(
+                                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                            ) {
+                                Text(
+                                    text = "${locOrders.size} Order",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = loc.address,
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+
+                        if (latestOrder != null) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Order Terakhir (${latestOrder.customerName.ifBlank { "Pelanggan" }})",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.secondary
+                                    )
+                                    Text(
+                                        text = latestOrder.itemsDescription,
+                                        fontSize = 12.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Text(
+                                        text = formatRupiah(latestOrder.totalAmount),
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    val sdf = remember { SimpleDateFormat("dd MMM, HH:mm", Locale("id", "ID")) }
+                                    Text(
+                                        text = sdf.format(Date(latestOrder.orderTime)),
+                                        fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = { onFlyToLocation(loc) },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(0.dp)
+                            ) {
+                                Icon(Icons.Default.MyLocation, null, modifier = Modifier.size(12.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Lompat GPS", fontSize = 10.sp)
+                            }
+                            OutlinedButton(
+                                onClick = { onViewHistoryClick(loc) },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(0.dp)
+                            ) {
+                                Icon(Icons.Default.History, null, modifier = Modifier.size(12.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Buka Riwayat", fontSize = 10.sp)
+                            }
+                            Button(
+                                onClick = { onAddOrderClick(loc) },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(0.dp)
+                            ) {
+                                Icon(Icons.Default.Add, null, modifier = Modifier.size(12.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Tambah Order", fontSize = 10.sp)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -657,8 +1037,476 @@ fun DashboardScreen(
                 }
             }
         } else {
-            items(orders.take(4)) { order ->
+            items(orders.take(4), key = { "order_feed_${it.orderId}" }) { order ->
                 DashboardOrderRow(order = order)
+            }
+        }
+    }
+}
+
+@Composable
+fun InteractiveCustomMap(
+    locations: List<SavedLocation>,
+    orders: List<OrderWithLocation>,
+    simulatedLat: Double,
+    simulatedLng: Double,
+    onAddOrderClick: (SavedLocation) -> Unit,
+    onViewHistoryClick: (SavedLocation) -> Unit,
+    onFlyToLocation: (SavedLocation) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var zoomLevel by remember { mutableStateOf(1.0f) }
+    var selectedLocation by remember { mutableStateOf<SavedLocation?>(null) }
+
+    // Constants for GPS bounds of Jakarta
+    val latMin = -6.210
+    val latMax = -6.180
+    val lngMin = 106.760
+    val lngMax = 106.840
+
+    // Pulse animation for simulated user position
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+    val pulseScale by infiniteTransition.animateFloat(
+        initialValue = 0.6f,
+        targetValue = 1.4f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "pulseScale"
+    )
+    val pulseAlpha by infiniteTransition.animateFloat(
+        initialValue = 1.0f,
+        targetValue = 0.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "pulseAlpha"
+    )
+
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(280.dp),
+        shape = RoundedCornerShape(20.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            // 1. The Canvas Map
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(locations, zoomLevel) {
+                        detectTapGestures { offset ->
+                            val centerX = size.width / 2f
+                            val centerY = size.height / 2f
+
+                            var clickedLoc: SavedLocation? = null
+                            var minDistance = Float.MAX_VALUE
+                            val clickThreshold = 24.dp.toPx()
+
+                            locations.forEach { loc ->
+                                val rawX = (size.width * (loc.longitude - lngMin) / (lngMax - lngMin)).toFloat()
+                                val rawY = (size.height * (latMax - loc.latitude) / (latMax - latMin)).toFloat()
+
+                                // Adjust for zoom level centering
+                                val pinX = (rawX - centerX) * zoomLevel + centerX
+                                val pinY = (rawY - centerY) * zoomLevel + centerY
+
+                                val dx = offset.x - pinX
+                                val dy = offset.y - pinY
+                                val dist = sqrt((dx * dx + dy * dy).toDouble()).toFloat()
+
+                                if (dist < clickThreshold && dist < minDistance) {
+                                    minDistance = dist
+                                    clickedLoc = loc
+                                }
+                            }
+                            selectedLocation = clickedLoc
+                        }
+                    }
+            ) {
+                val width = size.width
+                val height = size.height
+                val centerX = width / 2f
+                val centerY = height / 2f
+
+                // Map canvas transform scale
+                // Draw Map Background Grid
+                drawRect(color = Color(0xFFF1F5F9)) // Slate 100 for clean light theme map look
+
+                // Grid Lines
+                val latRange = latMax - latMin
+                val lngRange = lngMax - lngMin
+
+                // Draw vertical grid lines (longitude)
+                for (i in 0..8) {
+                    val rawX = width * i / 8f
+                    val x = (rawX - centerX) * zoomLevel + centerX
+
+                    if (x in 0f..width) {
+                        drawLine(
+                            color = Color.LightGray.copy(alpha = 0.5f),
+                            start = Offset(x, 0f),
+                            end = Offset(x, height),
+                            strokeWidth = 1.dp.toPx()
+                        )
+                    }
+                }
+
+                // Draw horizontal grid lines (latitude)
+                for (i in 0..6) {
+                    val rawY = height * i / 6f
+                    val y = (rawY - centerY) * zoomLevel + centerY
+
+                    if (y in 0f..height) {
+                        drawLine(
+                            color = Color.LightGray.copy(alpha = 0.5f),
+                            start = Offset(0f, y),
+                            end = Offset(width, y),
+                            strokeWidth = 1.dp.toPx()
+                        )
+                    }
+                }
+
+                // Draw stylized background Jakarta streets/roads for real map feeling
+                val roadColor = Color.White
+                val roadStroke = 4.dp.toPx() * zoomLevel
+
+                // Street 1: Jl. Jenderal Sudirman (diagonal-vertical)
+                val road1Path = Path().apply {
+                    val x1 = (width * 0.5f - centerX) * zoomLevel + centerX
+                    val y1 = (0f - centerY) * zoomLevel + centerY
+                    val x2 = (width * 0.55f - centerX) * zoomLevel + centerX
+                    val y2 = (height * 1f - centerY) * zoomLevel + centerY
+                    moveTo(x1, y1)
+                    lineTo(x2, y2)
+                }
+                drawPath(path = road1Path, color = roadColor, style = Stroke(roadStroke))
+
+                // Street 2: Jl. Gatot Subroto (horizontal curved)
+                val road2Path = Path().apply {
+                    val x1 = (0f - centerX) * zoomLevel + centerX
+                    val y1 = (height * 0.6f - centerY) * zoomLevel + centerY
+                    val cx = (width * 0.5f - centerX) * zoomLevel + centerX
+                    val cy = (height * 0.55f - centerY) * zoomLevel + centerY
+                    val x2 = (width * 1f - centerX) * zoomLevel + centerX
+                    val y2 = (height * 0.65f - centerY) * zoomLevel + centerY
+                    moveTo(x1, y1)
+                    quadraticTo(cx, cy, x2, y2)
+                }
+                drawPath(path = road2Path, color = roadColor, style = Stroke(roadStroke))
+
+                // Street 3: Tol Dalam Kota / Lingkar Luar (Outer Ring Road)
+                val road3Path = Path().apply {
+                    val x1 = (width * 0.1f - centerX) * zoomLevel + centerX
+                    val y1 = (height * 1f - centerY) * zoomLevel + centerY
+                    val cx = (width * 0.15f - centerX) * zoomLevel + centerX
+                    val cy = (height * 0.2f - centerY) * zoomLevel + centerY
+                    val x2 = (width * 0.9f - centerX) * zoomLevel + centerX
+                    val y2 = (0f - centerY) * zoomLevel + centerY
+                    moveTo(x1, y1)
+                    quadraticTo(cx, cy, x2, y2)
+                }
+                drawPath(path = road3Path, color = roadColor.copy(alpha = 0.8f), style = Stroke(roadStroke * 1.2f))
+
+                // Draw River (Kali Ciliwung) in translucent blue-green
+                val riverPath = Path().apply {
+                    val x1 = (width * 0.35f - centerX) * zoomLevel + centerX
+                    val y1 = (height * 1f - centerY) * zoomLevel + centerY
+                    val cx1 = (width * 0.3f - centerX) * zoomLevel + centerX
+                    val cy1 = (height * 0.5f - centerY) * zoomLevel + centerY
+                    val cx2 = (width * 0.45f - centerX) * zoomLevel + centerX
+                    val cy2 = (height * 0.3f - centerY) * zoomLevel + centerY
+                    val x2 = (width * 0.4f - centerX) * zoomLevel + centerX
+                    val y2 = (0f - centerY) * zoomLevel + centerY
+                    moveTo(x1, y1)
+                    cubicTo(cx1, cy1, cx2, cy2, x2, y2)
+                }
+                drawPath(path = riverPath, color = Color(0xFF93C5FD).copy(alpha = 0.4f), style = Stroke(8.dp.toPx() * zoomLevel))
+
+                // 2. Draw Current User / Virtual GPS Position
+                val gpsRawX = width * (simulatedLng - lngMin) / (lngMax - lngMin)
+                val gpsRawY = height * (latMax - simulatedLat) / (latMax - latMin)
+                val gpsX = ((gpsRawX - centerX) * zoomLevel + centerX).toFloat()
+                val gpsY = ((gpsRawY - centerY) * zoomLevel + centerY).toFloat()
+
+                // Pulsing accuracy halo
+                drawCircle(
+                    color = Color(0xFF3B82F6).copy(alpha = 0.2f * pulseAlpha),
+                    radius = 32.dp.toPx() * pulseScale * zoomLevel,
+                    center = Offset(gpsX, gpsY)
+                )
+
+                // User dot shadow
+                drawCircle(
+                    color = Color.Black.copy(alpha = 0.15f),
+                    radius = 8.dp.toPx() * zoomLevel,
+                    center = Offset(gpsX, gpsY + 2.dp.toPx())
+                )
+
+                // Inner primary dot
+                drawCircle(
+                    color = Color(0xFF3B82F6),
+                    radius = 7.dp.toPx() * zoomLevel,
+                    center = Offset(gpsX, gpsY)
+                )
+
+                // White outline
+                drawCircle(
+                    color = Color.White,
+                    radius = 7.dp.toPx() * zoomLevel,
+                    style = Stroke(2.dp.toPx()),
+                    center = Offset(gpsX, gpsY)
+                )
+
+                // 3. Draw Saved Locations pins
+                locations.forEach { loc ->
+                    val pinRawX = width * (loc.longitude - lngMin) / (lngMax - lngMin)
+                    val pinRawY = height * (latMax - loc.latitude) / (latMax - latMin)
+                    val pinX = ((pinRawX - centerX) * zoomLevel + centerX).toFloat()
+                    val pinY = ((pinRawY - centerY) * zoomLevel + centerY).toFloat()
+
+                    val isSelected = selectedLocation?.id == loc.id
+                    val ordersCount = orders.count { it.locationId == loc.id }
+                    val hasOrders = ordersCount > 0
+
+                    val pinColor = when {
+                        isSelected -> Color(0xFFEF4444) // Vibrant Red for selection
+                        hasOrders -> Color(0xFF10B981) // Emerald Green for locations with active orders
+                        loc.isFavorite -> Color(0xFFF59E0B) // Amber for favorites
+                        else -> Color(0xFF6366F1) // Indigo for normal locations
+                    }
+
+                    // Render Pin shadow
+                    drawCircle(
+                        color = Color.Black.copy(alpha = 0.2f),
+                        radius = (if (isSelected) 7.dp.toPx() else 5.dp.toPx()) * zoomLevel,
+                        center = Offset(pinX, pinY + (if (isSelected) 6.dp.toPx() else 4.dp.toPx()))
+                    )
+
+                    // Draw outer pin circle
+                    drawCircle(
+                        color = pinColor,
+                        radius = (if (isSelected) 12.dp.toPx() else 8.dp.toPx()) * zoomLevel,
+                        center = Offset(pinX, pinY)
+                    )
+
+                    // Draw white border
+                    drawCircle(
+                        color = Color.White,
+                        radius = (if (isSelected) 12.dp.toPx() else 8.dp.toPx()) * zoomLevel,
+                        style = Stroke(1.5.dp.toPx() * zoomLevel),
+                        center = Offset(pinX, pinY)
+                    )
+
+                    // Draw center dot/indicator
+                    val centerDotRadius = (if (isSelected) 4.dp.toPx() else 3.dp.toPx()) * zoomLevel
+                    drawCircle(
+                        color = Color.White,
+                        radius = centerDotRadius,
+                        center = Offset(pinX, pinY)
+                    )
+                }
+            }
+
+            // Overlay 1: Title of Map in top-left
+            Box(
+                modifier = Modifier
+                    .padding(12.dp)
+                    .align(Alignment.TopStart)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.White.copy(alpha = 0.9f))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Navigation,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "PETA KURIR AKTIF",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+
+            // Overlay 2: Zoom Controls in bottom-right
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                FilledIconButton(
+                    onClick = { if (zoomLevel < 3.0f) zoomLevel += 0.5f },
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = Color.White,
+                        contentColor = MaterialTheme.colorScheme.primary
+                    ),
+                    modifier = Modifier.size(36.dp),
+                    shape = CircleShape
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = "Zoom In", modifier = Modifier.size(18.dp))
+                }
+                FilledIconButton(
+                    onClick = { if (zoomLevel > 1.0f) zoomLevel -= 0.5f },
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = Color.White,
+                        contentColor = MaterialTheme.colorScheme.primary
+                    ),
+                    modifier = Modifier.size(36.dp),
+                    shape = CircleShape
+                ) {
+                    Icon(Icons.Default.Remove, contentDescription = "Zoom Out", modifier = Modifier.size(18.dp))
+                }
+                FilledIconButton(
+                    onClick = { zoomLevel = 1.0f },
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = Color.White,
+                        contentColor = MaterialTheme.colorScheme.primary
+                    ),
+                    modifier = Modifier.size(36.dp),
+                    shape = CircleShape
+                ) {
+                    Icon(Icons.Default.CenterFocusStrong, contentDescription = "Reset Zoom", modifier = Modifier.size(16.dp))
+                }
+            }
+        }
+    }
+
+    // Interactive details card when a pin is selected on the map
+    AnimatedVisibility(
+        visible = selectedLocation != null,
+        enter = fadeIn(),
+        exit = fadeOut()
+    ) {
+        selectedLocation?.let { loc ->
+            val distance = FloatArray(1).apply {
+                android.location.Location.distanceBetween(
+                    simulatedLat, simulatedLng,
+                    loc.latitude, loc.longitude,
+                    this
+                )
+            }[0].toInt()
+
+            val locOrders = orders.filter { it.locationId == loc.id }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 8.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = if (loc.isFavorite) Icons.Default.Star else Icons.Default.Place,
+                                contentDescription = null,
+                                tint = if (loc.isFavorite) Color(0xFFF59E0B) else MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = loc.name,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        IconButton(
+                            onClick = { selectedLocation = null },
+                            modifier = Modifier.size(24.dp)
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = "Tutup", modifier = Modifier.size(16.dp))
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = loc.address,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        Text(
+                            text = "📍 Jarak: ${distance}m",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (distance <= 300) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = "📦 Order: ${locOrders.size} kali",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    if (loc.notes.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "Memo: ${loc.notes}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { onFlyToLocation(loc) },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                        ) {
+                            Icon(Icons.Default.MyLocation, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Lompat GPS", fontSize = 11.sp)
+                        }
+                        OutlinedButton(
+                            onClick = { onViewHistoryClick(loc) },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                        ) {
+                            Icon(Icons.Default.History, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Riwayat", fontSize = 11.sp)
+                        }
+                        Button(
+                            onClick = { onAddOrderClick(loc) },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Order Baru", fontSize = 11.sp)
+                        }
+                    }
+                }
             }
         }
     }
@@ -2016,5 +2864,425 @@ fun formatRupiah(amount: Double): String {
         format.format(amount)
     } catch (e: Exception) {
         "Rp " + String.format("%,d", amount.toLong())
+    }
+}
+
+@Composable
+fun ProfileScreen(
+    viewModel: OrderViewModel,
+    isLoggedIn: Boolean,
+    displayName: String?,
+    email: String?,
+    photoUrl: String?,
+    onGoogleSignInClick: () -> Unit
+) {
+    var isEditing by remember { mutableStateOf(false) }
+    var editName by remember { mutableStateOf(displayName ?: "") }
+    var editEmail by remember { mutableStateOf(email ?: "") }
+
+    LaunchedEffect(displayName, email) {
+        if (!isEditing) {
+            editName = displayName ?: ""
+            editEmail = email ?: ""
+        }
+    }
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        item {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("profile_status_card"),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = "🔐 Keamanan Akun & Profil",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Semua data identitas Anda dienkripsi penuh di tingkat penyimpanan perangkat menggunakan AES-GCM 128-bit.",
+                        style = MaterialTheme.typography.bodySmall,
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+
+        if (isLoggedIn) {
+            item {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    // Profile Image with elegant border
+                    Box(
+                        modifier = Modifier
+                            .size(100.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primaryContainer),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (!photoUrl.isNullOrEmpty()) {
+                            AsyncImage(
+                                model = photoUrl,
+                                contentDescription = "Foto Profil",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                            )
+                        } else {
+                            Text(
+                                text = (displayName ?: "U").take(1).uppercase(),
+                                style = MaterialTheme.typography.headlineLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    if (isEditing) {
+                        OutlinedTextField(
+                            value = editName,
+                            onValueChange = { editName = it },
+                            label = { Text("Nama Lengkap") },
+                            singleLine = true,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("edit_name_input"),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = editEmail,
+                            onValueChange = { editEmail = it },
+                            label = { Text("Email") },
+                            singleLine = true,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("edit_email_input"),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            OutlinedButton(
+                                onClick = { isEditing = false },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Text("Batal")
+                            }
+                            Button(
+                                onClick = {
+                                    if (editName.isNotBlank() && editEmail.isNotBlank()) {
+                                        viewModel.updateProfile(editName, editEmail)
+                                        isEditing = false
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Text("Simpan")
+                            }
+                        }
+                    } else {
+                        Text(
+                            text = displayName ?: "Pengguna Google",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        Text(
+                            text = email ?: "tidak-ada-email@google.com",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            OutlinedButton(
+                                onClick = { isEditing = true },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Ubah Profil")
+                            }
+                            Button(
+                                onClick = { viewModel.signOut() },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.Logout, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Keluar Akun")
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Real-time security visualization card showing decrypted vs encrypted physical storage!
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Security,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Visualisasi Enkripsi Fisik di Disk",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "Berikut adalah perbandingan data Anda dalam RAM (Plaintext) dibandingkan dengan data terenkripsi di dalam file SharedPreferences (Ciphertext):",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Field 1: Name
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
+                                .padding(8.dp)
+                        ) {
+                            Text("Variabel: Display Name", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Plaintext (RAM):", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(displayName ?: "", fontSize = 11.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                Column(modifier = Modifier.weight(1.5f)) {
+                                    Text("Ciphertext (Disk):", fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
+                                    Text(
+                                        com.example.security.CryptoManager.encrypt(displayName ?: ""),
+                                        fontSize = 11.sp,
+                                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.error,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // Field 2: Email
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
+                                .padding(8.dp)
+                        ) {
+                            Text("Variabel: Email Address", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Plaintext (RAM):", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(email ?: "", fontSize = 11.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                Column(modifier = Modifier.weight(1.5f)) {
+                                    Text("Ciphertext (Disk):", fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
+                                    Text(
+                                        com.example.security.CryptoManager.encrypt(email ?: ""),
+                                        fontSize = 11.sp,
+                                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                        color = MaterialTheme.colorScheme.error,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            item {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AccountCircle,
+                        contentDescription = null,
+                        modifier = Modifier.size(90.dp),
+                        tint = MaterialTheme.colorScheme.outline.copy(alpha = 0.6f)
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = "Anda Belum Masuk",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onBackground
+                    )
+                    Text(
+                        text = "Masuk untuk mengakses rincian profil pengiriman dan menyelaraskan dengan aman.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp)
+                    )
+
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    // Real Google Sign-In Button
+                    Button(
+                        onClick = onGoogleSignInClick,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp)
+                            .testTag("google_signin_button"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.onBackground,
+                            contentColor = MaterialTheme.colorScheme.background
+                        ),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Login,
+                                contentDescription = null,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Masuk dengan Google (API GMS)",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    // Google simulation block for container/sandbox environments
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.2f)
+                        ),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f))
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.BugReport,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "Simulasi Masuk Google (Terenkripsi)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Gunakan simulasi ini di lingkungan uji jika API Google Sign-In memerlukan sidik jari SHA-1 yang belum terdaftar. Meniru persis alur enkripsi local storage.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+
+                            Spacer(modifier = Modifier.height(16.dp))
+
+                            Text(
+                                text = "Akun Google Tersedia:",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.simulateGoogleSignIn(
+                                        "Bandar Sembiring",
+                                        "bandarsembiring166@gmail.com",
+                                        "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&q=80"
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.VerifiedUser, null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Masuk sebagai: bandarsembiring166@gmail.com", fontSize = 11.sp)
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.simulateGoogleSignIn(
+                                        "Guest Tester",
+                                        "tester.aistudio@gmail.com",
+                                        null
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.AccountCircle, null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Masuk sebagai: tester.aistudio@gmail.com", fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
